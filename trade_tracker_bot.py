@@ -64,7 +64,7 @@ async def image_to_base64(url):
             data = await resp.read()
             return base64.b64encode(data).decode("utf-8")
 
-async def extract_trade_data(image_base64, image_url):
+async def extract_trade_data(image_base64, image_url, media_type="image/jpeg"):
     """Use Claude Vision to extract trade data from screenshot."""
     prompt = """You are analyzing a trading screenshot from Robinhood.
 
@@ -115,7 +115,7 @@ Return ONLY the JSON, no explanation."""
                         "type": "image",
                         "source": {
                             "type": "base64",
-                            "media_type": "image/jpeg",
+                            "media_type": media_type,
                             "data": image_base64
                         }
                     },
@@ -258,8 +258,24 @@ async def on_message(message):
 
     # Check if attachment is an image
     attachment = message.attachments[0]
-    if not any(attachment.filename.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp"]):
+    allowed_exts = [".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".gif", ".bmp", ".tiff"]
+    is_image = (
+        any(attachment.filename.lower().endswith(ext) for ext in allowed_exts)
+        or (attachment.content_type and "image" in attachment.content_type.lower())
+    )
+    if not is_image:
         return
+
+    # Detect media type
+    fname = attachment.filename.lower()
+    if fname.endswith(".png"):
+        media_type = "image/png"
+    elif fname.endswith(".webp"):
+        media_type = "image/webp"
+    elif fname.endswith(".gif"):
+        media_type = "image/gif"
+    else:
+        media_type = "image/jpeg"
 
     # React to show processing
     await message.add_reaction("⏳")
@@ -269,7 +285,7 @@ async def on_message(message):
         image_b64 = await image_to_base64(attachment.url)
 
         # Extract trade data via Claude Vision
-        trade_data = await extract_trade_data(image_b64, attachment.url)
+        trade_data = await extract_trade_data(image_b64, attachment.url, media_type)
         print(f"Extracted trade data: {trade_data}")
 
         # Write to Google Sheet
