@@ -135,7 +135,7 @@ def append_to_csp(ws, data):
     """Append to CSP tab: Symbol, Strike Price, Contracts, Entry, Expiration, Premium"""
     row = get_next_empty_row(ws)
     today = data.get("date_opened") or datetime.now().strftime("%-m/%-d/%Y")
-    ws.update(f"A{row}:F{row}", [[
+    ws.update(range_name=f"A{row}:F{row}", values=[[
         data.get("ticker", ""),
         data.get("strike_price", ""),
         data.get("contracts", 1),
@@ -157,7 +157,7 @@ def append_to_bps(ws, data):
     except:
         dte = ""
 
-    ws.update(f"A{row}:I{row}", [[
+    ws.update(range_name=f"A{row}:I{row}", values=[[
         today,
         data.get("ticker", ""),
         data.get("short_strike", ""),
@@ -181,7 +181,7 @@ def append_to_cs(ws, data):
     except:
         dte = ""
 
-    ws.update(f"A{row}:I{row}", [[
+    ws.update(range_name=f"A{row}:I{row}", values=[[
         today,
         data.get("ticker", ""),
         data.get("short_strike", ""),
@@ -198,7 +198,7 @@ def append_to_cc(ws, data):
     """Append to CC tab: Symbol, Shares, Date Opened, Expiration, Call Strike, Current Stock Price, Premium"""
     row = get_next_empty_row(ws)
     today = data.get("date_opened") or datetime.now().strftime("%-m/%-d/%Y")
-    ws.update(f"A{row}:G{row}", [[
+    ws.update(range_name=f"A{row}:G{row}", values=[[
         data.get("ticker", ""),
         data.get("shares", ""),
         today,
