@@ -3,6 +3,9 @@ Discord Trade Tracker Bot
 Watches #trade-tracker channel for trade screenshots
 Uses Claude Vision to extract trade data
 Auto-fills the correct tab in Google Sheet based on trade type
+
+Also watches #stock-alerts for $TICKER messages
+Analyzes stock against Z's options strategies using Tradier + Claude
 """
 
 import discord
@@ -19,8 +22,10 @@ import aiohttp
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 DISCORD_BOT_TOKEN   = os.environ.get("DISCORD_TRADE_BOT_TOKEN", "")
 ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
+TRADIER_TOKEN       = os.environ.get("TRADIER_TOKEN", "")
 SPREADSHEET_ID      = "1yEN54IvJ7E8h0Eh1R3HlXdWFUXO6ePQAs40IiznxjKY"
 TRADE_TRACKER_CHANNEL = "trade-tracker"
+STOCK_ALERTS_CHANNEL  = "stock-alerts"
 
 # Google Sheets setup
 SCOPES = [
@@ -47,25 +52,21 @@ def get_sheets_client():
     return gspread.authorize(creds)
 
 def get_next_empty_row(worksheet):
-    """Find next empty row in sheet."""
     col_a = worksheet.col_values(1)
-    # Skip header rows
     for i, val in enumerate(col_a):
-        if i < 3:  # skip header rows
+        if i < 3:
             continue
         if not val or val.strip() == "" or val.strip() == "-":
             return i + 1
     return len(col_a) + 1
 
 async def image_to_base64(url):
-    """Download image and convert to base64."""
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as resp:
             data = await resp.read()
             return base64.b64encode(data).decode("utf-8")
 
 async def extract_trade_data(image_base64, image_url):
-    """Use Claude Vision to extract trade data from screenshot."""
     prompt = """You are analyzing a trading screenshot from Robinhood.
 
 Extract ALL trade information visible and return ONLY a JSON object with no other text.
@@ -127,12 +128,10 @@ Return ONLY the JSON, no explanation."""
     )
     response.raise_for_status()
     raw = response.json()["content"][0]["text"].strip()
-    # Strip markdown if present
     raw = re.sub(r"```json|```", "", raw).strip()
     return json.loads(raw)
 
 def append_to_csp(ws, data):
-    """Append to CSP tab: Symbol, Strike Price, Contracts, Entry, Expiration, Premium"""
     row = get_next_empty_row(ws)
     today = data.get("date_opened") or datetime.now().strftime("%-m/%-d/%Y")
     ws.update(range_name=f"A{row}:F{row}", values=[[
@@ -146,17 +145,13 @@ def append_to_csp(ws, data):
     return row
 
 def append_to_bps(ws, data):
-    """Append to BPS tab: Date Opened, Ticker, Short Strike, Long Strike, Width, Expiration, DTE, Credit Collected, Contracts"""
     row = get_next_empty_row(ws)
     today = data.get("date_opened") or datetime.now().strftime("%-m/%-d/%Y")
-    
-    # Calculate DTE
     try:
         exp = datetime.strptime(data.get("expiration", ""), "%m/%d/%Y")
         dte = (exp - datetime.now()).days
     except:
         dte = ""
-
     ws.update(range_name=f"A{row}:I{row}", values=[[
         today,
         data.get("ticker", ""),
@@ -171,16 +166,13 @@ def append_to_bps(ws, data):
     return row
 
 def append_to_cs(ws, data):
-    """Append to CS tab: Date Opened, Ticker, Short Strike, Long Strike, Width, Expiration, DTE, Credit Collected, Contracts"""
     row = get_next_empty_row(ws)
     today = data.get("date_opened") or datetime.now().strftime("%-m/%-d/%Y")
-
     try:
         exp = datetime.strptime(data.get("expiration", ""), "%m/%d/%Y")
         dte = (exp - datetime.now()).days
     except:
         dte = ""
-
     ws.update(range_name=f"A{row}:I{row}", values=[[
         today,
         data.get("ticker", ""),
@@ -195,11 +187,9 @@ def append_to_cs(ws, data):
     return row
 
 def append_to_cc(ws, data):
-    """Append to CC tab: Symbol, Contracts, Date Opened, Expiration, Call Strike, [F=GOOGLEFINANCE formula — skip], Premium"""
     row = get_next_empty_row(ws)
     today = data.get("date_opened") or datetime.now().strftime("%-m/%-d/%Y")
     contracts = data.get("contracts") or data.get("shares") or 1
-    # Write A-E (skip F which has GOOGLEFINANCE formula)
     ws.update(range_name=f"A{row}:E{row}", values=[[
         data.get("ticker", ""),
         contracts,
@@ -207,17 +197,13 @@ def append_to_cc(ws, data):
         data.get("expiration", ""),
         data.get("call_strike", "") or data.get("strike_price", ""),
     ]])
-    # Write G (premium) separately — skips F
     ws.update(range_name=f"G{row}", values=[[data.get("premium", "")]])
     return row
 
 def write_to_sheet(trade_data):
-    """Route trade data to correct sheet tab."""
     client = get_sheets_client()
     sheet = client.open_by_key(SPREADSHEET_ID)
-    
     trade_type = trade_data.get("type", "").upper()
-    
     if trade_type == "CSP":
         ws = sheet.worksheet("CSP")
         row = append_to_csp(ws, trade_data)
@@ -237,6 +223,243 @@ def write_to_sheet(trade_data):
     else:
         raise ValueError(f"Unknown trade type: {trade_type}")
 
+# ── STOCK ALERTS ANALYZER ─────────────────────────────────────────────────────
+
+def get_stock_data(ticker):
+    """Get current price and basic info from Tradier."""
+    try:
+        r = requests.get(
+            f"https://api.tradier.com/v1/markets/quotes",
+            headers={"Authorization": f"Bearer {TRADIER_TOKEN}", "Accept": "application/json"},
+            params={"symbols": ticker},
+            timeout=10
+        )
+        r.raise_for_status()
+        quote = r.json()["quotes"]["quote"]
+        return {
+            "price": quote.get("last") or quote.get("close"),
+            "volume": quote.get("volume"),
+            "week52_high": quote.get("week_52_high"),
+            "week52_low": quote.get("week_52_low"),
+            "change_pct": quote.get("change_percentage"),
+        }
+    except Exception as e:
+        print(f"Tradier quote error: {e}")
+        return None
+
+def get_options_data(ticker):
+    """Get nearest expirations and sample strikes from Tradier."""
+    try:
+        # Get expirations
+        r = requests.get(
+            f"https://api.tradier.com/v1/markets/options/expirations",
+            headers={"Authorization": f"Bearer {TRADIER_TOKEN}", "Accept": "application/json"},
+            params={"symbol": ticker, "includeAllRoots": "true"},
+            timeout=10
+        )
+        r.raise_for_status()
+        expirations = r.json()["expirations"]["date"]
+        if isinstance(expirations, str):
+            expirations = [expirations]
+
+        # Get ~30 DTE expiration for CSP/CC
+        from datetime import timedelta
+        today = datetime.now()
+        target_30 = today + timedelta(days=30)
+        target_90 = today + timedelta(days=90)
+
+        exp_30 = None
+        exp_90 = None
+        exp_leaps = None
+
+        for e in expirations:
+            d = datetime.strptime(e, "%Y-%m-%d")
+            if exp_30 is None and d >= target_30:
+                exp_30 = e
+            if exp_90 is None and d >= target_90:
+                exp_90 = e
+            if exp_leaps is None and d >= today + timedelta(days=300):
+                exp_leaps = e
+
+        return {
+            "expirations": expirations[:6],
+            "exp_30": exp_30,
+            "exp_90": exp_90,
+            "exp_leaps": exp_leaps,
+        }
+    except Exception as e:
+        print(f"Tradier expirations error: {e}")
+        return None
+
+def get_options_chain(ticker, expiration, option_type="put"):
+    """Get options chain for a specific expiration."""
+    try:
+        r = requests.get(
+            f"https://api.tradier.com/v1/markets/options/chains",
+            headers={"Authorization": f"Bearer {TRADIER_TOKEN}", "Accept": "application/json"},
+            params={"symbol": ticker, "expiration": expiration, "optionType": option_type},
+            timeout=10
+        )
+        r.raise_for_status()
+        options = r.json()["options"]["option"]
+        if isinstance(options, dict):
+            options = [options]
+        return options
+    except Exception as e:
+        print(f"Tradier chain error: {e}")
+        return []
+
+def find_csp_strike(options, price):
+    """Find best CSP strike ~5% OTM with decent premium."""
+    target = price * 0.95
+    best = None
+    best_diff = float("inf")
+    for o in options:
+        strike = o.get("strike", 0)
+        if strike <= 0:
+            continue
+        diff = abs(strike - target)
+        if diff < best_diff:
+            best_diff = diff
+            best = o
+    return best
+
+def find_spread_strikes(options, price, width=5):
+    """Find best credit spread: sell ~5% OTM, buy width below."""
+    target_short = price * 0.95
+    short = None
+    best_diff = float("inf")
+    for o in options:
+        strike = o.get("strike", 0)
+        diff = abs(strike - target_short)
+        if diff < best_diff:
+            best_diff = diff
+            short = o
+    if not short:
+        return None, None
+    long_target = short["strike"] - width
+    long_opt = None
+    best_diff = float("inf")
+    for o in options:
+        diff = abs(o.get("strike", 0) - long_target)
+        if diff < best_diff:
+            best_diff = diff
+            long_opt = o
+    return short, long_opt
+
+def find_leaps_call(options, price):
+    """Find LEAPS call ~10-15% OTM."""
+    target = price * 1.10
+    best = None
+    best_diff = float("inf")
+    for o in options:
+        strike = o.get("strike", 0)
+        diff = abs(strike - target)
+        if diff < best_diff:
+            best_diff = diff
+            best = o
+    return best
+
+async def analyze_stock_for_strategies(ticker):
+    """Full analysis of ticker against all Z's strategies."""
+    ticker = ticker.upper()
+
+    # Get stock data
+    stock = get_stock_data(ticker)
+    if not stock or not stock.get("price"):
+        return f"❌ Could not get data for **{ticker}**. Check the ticker."
+
+    price = stock["price"]
+
+    # Get options expirations
+    opts_info = get_options_data(ticker)
+    if not opts_info:
+        return f"❌ No options data for **{ticker}**."
+
+    exp_30 = opts_info.get("exp_30")
+    exp_leaps = opts_info.get("exp_leaps")
+
+    # Get puts chain for CSP/BPS
+    puts_30 = get_options_chain(ticker, exp_30, "put") if exp_30 else []
+    # Get calls chain for CC/Bear Call
+    calls_30 = get_options_chain(ticker, exp_30, "call") if exp_30 else []
+    # Get LEAPS calls
+    leaps_calls = get_options_chain(ticker, exp_leaps, "call") if exp_leaps else []
+
+    # Find strikes
+    csp_strike = find_csp_strike(puts_30, price)
+    spread_short, spread_long = find_spread_strikes(puts_30, price, width=5)
+    leaps_call = find_leaps_call(leaps_calls, price) if leaps_calls else None
+
+    # Build context for Claude
+    context = f"""
+Ticker: {ticker}
+Current Price: ${price}
+52W High: ${stock.get('week52_high')}
+52W Low: ${stock.get('week52_low')}
+Change Today: {stock.get('change_pct')}%
+
+~30 DTE Expiration: {exp_30}
+LEAPS Expiration: {exp_leaps}
+
+CSP Candidate (~5% OTM put):
+{json.dumps(csp_strike, indent=2) if csp_strike else 'No data'}
+
+Bull Put Spread Candidates (~5% OTM short / 5-wide):
+Short: {json.dumps(spread_short, indent=2) if spread_short else 'No data'}
+Long: {json.dumps(spread_long, indent=2) if spread_long else 'No data'}
+
+LEAPS Call (~10% OTM):
+{json.dumps(leaps_call, indent=2) if leaps_call else 'No data'}
+"""
+
+    # Ask Claude to analyze
+    prompt = f"""You are analyzing a stock for an options trader named Z.
+
+Z's strategies:
+1. CSP (Cash Secured Put) — sell OTM put ~30 DTE, collect premium, 5% OTM rule, RSI <60, VIX <30
+2. Bull Put Spread (BPS) — sell OTM put, buy further OTM put, same expiry, limits risk
+3. Bear Call Spread — sell OTM call, buy further OTM call (bearish/neutral)
+4. Covered Call (CC) — if Z owns shares, sell OTM call for income
+5. LEAPS — buy deep ITM call 9-12 months out as stock replacement
+6. PMCC (Poor Man's Covered Call) — buy LEAPS call, sell short-term OTM call against it
+
+Here is the market data:
+{context}
+
+Analyze each strategy and respond in this EXACT Discord format:
+
+📊 **{ticker}** — ${{price}}
+━━━━━━━━━━━━━━━━━━━━━━
+✅/❌ **CSP**: [Strike] put exp [date] — $[premium] premium | [reasoning in 1 line]
+✅/❌ **Bull Put Spread**: Sell $[short] / Buy $[long] exp [date] — $[credit] credit | [reasoning]
+✅/❌ **Bear Call Spread**: [reasoning why or why not]
+✅/❌ **LEAPS**: $[strike] call exp [date] — $[mid] cost | [reasoning]
+✅/❌ **PMCC**: [reasoning based on LEAPS availability]
+━━━━━━━━━━━━━━━━━━━━━━
+🎯 **Best Play**: [pick ONE strategy and explain why in 2 sentences]
+⚠️ **Risk**: [one key risk to watch]
+
+Use ✅ if the strategy looks good, ❌ if it doesn't fit right now.
+Be specific with strikes, premiums, and dates. Keep it concise."""
+
+    response = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+        },
+        json={
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 800,
+            "messages": [{"role": "user", "content": prompt}]
+        },
+        timeout=30
+    )
+    response.raise_for_status()
+    return response.json()["content"][0]["text"].strip()
+
 # ── DISCORD BOT ───────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
@@ -248,36 +471,45 @@ async def on_ready():
 
 @client.event
 async def on_message(message):
-    # Only process in #trade-tracker channel
-    if message.channel.name != TRADE_TRACKER_CHANNEL:
-        return
-    # Ignore bot messages
     if message.author.bot:
         return
-    # Only process messages with images
+
+    # ── STOCK ALERTS: analyze $TICKER ─────────────────────────────────────────
+    if message.channel.name == STOCK_ALERTS_CHANNEL:
+        # Look for $TICKER pattern
+        tickers = re.findall(r'\$([A-Za-z]{1,5})', message.content)
+        if tickers:
+            ticker = tickers[0].upper()
+            await message.add_reaction("⏳")
+            try:
+                analysis = await analyze_stock_for_strategies(ticker)
+                await message.remove_reaction("⏳", client.user)
+                await message.reply(analysis)
+            except Exception as e:
+                print(f"Stock analysis error: {e}")
+                await message.remove_reaction("⏳", client.user)
+                await message.reply(f"❌ Analysis failed for **{ticker}**: {str(e)}")
+        return
+
+    # ── TRADE TRACKER: log screenshots ────────────────────────────────────────
+    if message.channel.name != TRADE_TRACKER_CHANNEL:
+        return
     if not message.attachments:
         return
 
-    # Check if attachment is an image
     attachment = message.attachments[0]
     if not any(attachment.filename.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp"]):
         return
 
-    # React to show processing
     await message.add_reaction("⏳")
 
     try:
-        # Download and encode image
         image_b64 = await image_to_base64(attachment.url)
-
-        # Extract trade data via Claude Vision
         trade_data = await extract_trade_data(image_b64, attachment.url)
         print(f"Extracted trade data: {trade_data}")
 
-        # Write to Google Sheet
         tab, row = write_to_sheet(trade_data)
 
-        # Build confirmation message
         t = trade_data
         trade_type = t.get("type", "")
         ticker = t.get("ticker", "?")
