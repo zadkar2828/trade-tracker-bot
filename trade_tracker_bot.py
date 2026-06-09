@@ -195,12 +195,14 @@ def append_to_cs(ws, data):
     return row
 
 def append_to_cc(ws, data):
-    """Append to CC tab: Symbol, Shares, Date Opened, Expiration, Call Strike, Current Stock Price, Premium"""
+    """Append to CC tab: Symbol, Contracts, Date Opened, Expiration, Call Strike, Current Stock Price, Premium"""
     row = get_next_empty_row(ws)
     today = data.get("date_opened") or datetime.now().strftime("%-m/%-d/%Y")
+    # CC uses contracts (number of option contracts sold)
+    contracts = data.get("contracts") or data.get("shares") or 1
     ws.update(range_name=f"A{row}:G{row}", values=[[
         data.get("ticker", ""),
-        data.get("shares", ""),
+        contracts,
         today,
         data.get("expiration", ""),
         data.get("call_strike", "") or data.get("strike_price", ""),
