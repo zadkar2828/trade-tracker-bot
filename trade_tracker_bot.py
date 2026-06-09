@@ -468,9 +468,14 @@ client = discord.Client(intents=intents)
 @client.event
 async def on_ready():
     print(f"Trade Tracker Bot online as {client.user}")
+    for guild in client.guilds:
+        print(f"Server: {guild.name}")
+        for ch in guild.channels:
+            print(f"  Channel: {ch.name} ({ch.type})")
 
 @client.event
 async def on_message(message):
+    print(f"MSG in #{message.channel.name} from {message.author}: {message.content[:50]}")
     if message.author.bot:
         return
 
