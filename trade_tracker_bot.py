@@ -19,7 +19,7 @@ import aiohttp
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 DISCORD_BOT_TOKEN   = os.environ.get("DISCORD_TRADE_BOT_TOKEN", "")
 ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
-SPREADSHEET_ID      = "1w0Pb_aNoR-IW_kaMi1yqKyn9ofQMtDeF"
+SPREADSHEET_ID      = "1yEN54IvJ7E8h0Eh1R3HlXdWFUXO6ePQAs40IiznxjKY"
 TRADE_TRACKER_CHANNEL = "trade-tracker"
 
 # Google Sheets setup
@@ -64,7 +64,7 @@ async def image_to_base64(url):
             data = await resp.read()
             return base64.b64encode(data).decode("utf-8")
 
-async def extract_trade_data(image_base64, image_url, media_type="image/jpeg"):
+async def extract_trade_data(image_base64, image_url):
     """Use Claude Vision to extract trade data from screenshot."""
     prompt = """You are analyzing a trading screenshot from Robinhood.
 
@@ -115,7 +115,7 @@ Return ONLY the JSON, no explanation."""
                         "type": "image",
                         "source": {
                             "type": "base64",
-                            "media_type": media_type,
+                            "media_type": "image/jpeg",
                             "data": image_base64
                         }
                     },
@@ -258,24 +258,8 @@ async def on_message(message):
 
     # Check if attachment is an image
     attachment = message.attachments[0]
-    allowed_exts = [".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".gif", ".bmp", ".tiff"]
-    is_image = (
-        any(attachment.filename.lower().endswith(ext) for ext in allowed_exts)
-        or (attachment.content_type and "image" in attachment.content_type.lower())
-    )
-    if not is_image:
+    if not any(attachment.filename.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp"]):
         return
-
-    # Detect media type
-    fname = attachment.filename.lower()
-    if fname.endswith(".png"):
-        media_type = "image/png"
-    elif fname.endswith(".webp"):
-        media_type = "image/webp"
-    elif fname.endswith(".gif"):
-        media_type = "image/gif"
-    else:
-        media_type = "image/jpeg"
 
     # React to show processing
     await message.add_reaction("⏳")
@@ -285,7 +269,7 @@ async def on_message(message):
         image_b64 = await image_to_base64(attachment.url)
 
         # Extract trade data via Claude Vision
-        trade_data = await extract_trade_data(image_b64, attachment.url, media_type)
+        trade_data = await extract_trade_data(image_b64, attachment.url)
         print(f"Extracted trade data: {trade_data}")
 
         # Write to Google Sheet
