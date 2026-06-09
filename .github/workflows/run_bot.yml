@@ -1,28 +1,23 @@
 name: Trade Tracker Bot
-
 on:
   workflow_dispatch:
   push:
     branches: [main]
-
 jobs:
   run-bot:
     runs-on: ubuntu-latest
     timeout-minutes: 350
-
     steps:
       - uses: actions/checkout@v5
-
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
-
       - name: Install dependencies
         run: pip install -r requirements.txt
-
       - name: Run Trade Tracker Bot
         env:
           DISCORD_TRADE_BOT_TOKEN: ${{ secrets.DISCORD_TRADE_BOT_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GOOGLE_PRIVATE_KEY: ${{ secrets.GOOGLE_PRIVATE_KEY }}
+          TRADIER_TOKEN: ${{ secrets.TRADIER_TOKEN }}
         run: python trade_tracker_bot.py
