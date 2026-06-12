@@ -189,11 +189,12 @@ def get_options_chain(ticker, expiration, option_type="put"):
         r = requests.get(
             "https://api.tradier.com/v1/markets/options/chains",
             headers={"Authorization": f"Bearer {TRADIER_TOKEN}", "Accept": "application/json"},
-            params={"symbol": ticker, "expiration": expiration, "optionType": option_type}, timeout=10
+            params={"symbol": ticker, "expiration": expiration, "greeks": "false"}, timeout=10
         )
         r.raise_for_status()
         options = r.json()["options"]["option"]
-        return [options] if isinstance(options, dict) else options
+        options = [options] if isinstance(options, dict) else options
+        return [o for o in options if o.get("option_type") == option_type]
     except Exception as e:
         print(f"Tradier chain error: {e}")
         return []
