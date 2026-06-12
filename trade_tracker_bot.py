@@ -228,6 +228,8 @@ async def analyze_stock(ticker):
     csp = find_strike_near(puts, price * 0.95)
     spread_short = find_strike_near(puts, price * 0.95)
     spread_long = find_strike_near(puts, price * 0.90)
+    call_spread_short = find_strike_near(calls, price * 1.05)
+    call_spread_long = find_strike_near(calls, price * 1.10)
     leaps_call = find_strike_near(leaps, price * 1.10) if leaps else None
 
     context = f"""
@@ -237,8 +239,10 @@ Change: {stock.get('change_pct')}%
 30DTE exp: {exp_30} | LEAPS exp: {exp_leaps}
 
 CSP candidate: {json.dumps(csp) if csp else 'none'}
-Spread short: {json.dumps(spread_short) if spread_short else 'none'}
-Spread long: {json.dumps(spread_long) if spread_long else 'none'}
+Bull Put Spread short: {json.dumps(spread_short) if spread_short else 'none'}
+Bull Put Spread long: {json.dumps(spread_long) if spread_long else 'none'}
+Bear Call Spread short: {json.dumps(call_spread_short) if call_spread_short else 'none'}
+Bear Call Spread long: {json.dumps(call_spread_long) if call_spread_long else 'none'}
 LEAPS call: {json.dumps(leaps_call) if leaps_call else 'none'}
 """
     print(f"Calling Claude for analysis...")
