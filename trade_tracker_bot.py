@@ -59,7 +59,7 @@ async def image_to_base64(url):
             data = await resp.read()
             return base64.b64encode(data).decode("utf-8")
 
-async def extract_trade_data(image_base64, image_url):
+async def extract_trade_data(image_base64, image_url, media_type="image/png"):
     prompt = """You are analyzing a trading screenshot from Robinhood.
 Extract ALL trade information visible and return ONLY a JSON object with no other text.
 Detect the trade type first:
@@ -72,9 +72,11 @@ Return ONLY the JSON."""
     response = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={"Content-Type": "application/json", "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01"},
-        json={"model": "claude-sonnet-4-20250514", "max_tokens": 500, "messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_base64}}, {"type": "text", "text": prompt}]}]},
+        json={"model": "claude-sonnet-4-20250514", "max_tokens": 500, "messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_base64}}, {"type": "text", "text": prompt}]}]},
         timeout=30
     )
+    if response.status_code != 200:
+        print(f"Claude API error {response.status_code}: {response.text[:500]}")
     response.raise_for_status()
     raw = response.json()["content"][0]["text"].strip()
     raw = re.sub(r"```json|```", "", raw).strip()
@@ -185,7 +187,7 @@ def find_strike_near(options, target_price):
 async def analyze_stock(ticker):
     ticker = ticker.upper()
     print(f"Analyzing {ticker}...")
-    
+
     stock = get_stock_data(ticker)
     if not stock or not stock.get("price"):
         return f"❌ No data for **{ticker}**."
@@ -263,7 +265,7 @@ async def on_ready():
 async def on_message(message):
     try:
         print(f"MSG: #{message.channel.name} | {message.author}: {message.content[:80]}")
-        
+
         if message.author.bot:
             return
 
@@ -290,13 +292,22 @@ async def on_message(message):
             return
 
         attachment = message.attachments[0]
-        if not any(attachment.filename.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp"]):
+        filename_lower = attachment.filename.lower()
+        if filename_lower.endswith(".png"):
+            media_type = "image/png"
+        elif filename_lower.endswith((".jpg", ".jpeg")):
+            media_type = "image/jpeg"
+        elif filename_lower.endswith(".webp"):
+            media_type = "image/webp"
+        elif filename_lower.endswith(".gif"):
+            media_type = "image/gif"
+        else:
             return
 
         await message.add_reaction("⏳")
         try:
             image_b64 = await image_to_base64(attachment.url)
-            trade_data = await extract_trade_data(image_b64, attachment.url)
+            trade_data = await extract_trade_data(image_b64, attachment.url, media_type)
             print(f"Trade data: {trade_data}")
             tab, row = write_to_sheet(trade_data)
             t = trade_data
