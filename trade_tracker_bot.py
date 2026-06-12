@@ -62,8 +62,17 @@ async def image_to_base64(url):
 async def extract_trade_data(image_base64, image_url, media_type="image/png"):
     prompt = """You are analyzing a trading screenshot from Robinhood.
 Extract ALL trade information visible and return ONLY a JSON object with no other text.
-Detect the trade type first:
-- CSP, BPS, CS, or CC
+
+Detect the trade type first — pick exactly one of: CSP, BPS, CS, CC
+
+Type definitions (IMPORTANT — read carefully):
+- CSP = Cash Secured Put: selling a single PUT option, no spread.
+- CC = Covered Call: selling a single CALL option against owned shares.
+- BPS = Bull Put Spread: a PUT credit spread (sell higher-strike put, buy lower-strike put). Both legs are PUTS.
+- CS = Call Spread / Bear Call Spread: a CALL credit spread (sell lower-strike call, buy higher-strike call). Both legs are CALLS.
+
+If the screenshot shows "Sell ... Call" and "Buy ... Call" as the two legs, the type is CS, NOT BPS — even though both are credit spreads.
+If the screenshot shows "Sell ... Put" and "Buy ... Put" as the two legs, the type is BPS.
 
 IMPORTANT — premium field:
 Robinhood spread screenshots show a large dollar total at the top (e.g. "$70.00")
