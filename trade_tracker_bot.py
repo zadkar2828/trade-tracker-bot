@@ -64,6 +64,15 @@ async def extract_trade_data(image_base64, image_url, media_type="image/png"):
 Extract ALL trade information visible and return ONLY a JSON object with no other text.
 Detect the trade type first:
 - CSP, BPS, CS, or CC
+
+IMPORTANT — premium field:
+Robinhood spread screenshots show a large dollar total at the top (e.g. "$70.00")
+which is the TOTAL credit/debit for ALL contracts combined. Do NOT use that number.
+Instead use the PER-SHARE "Limit price" value (e.g. "$0.70") shown in the
+order details — this is the premium per contract, which is what "premium"
+should contain. For CSP/CC trades, use the per-contract premium/limit price
+the same way, not any multiplied total.
+
 Return JSON with type, ticker, date_opened, expiration, strike_price, short_strike, long_strike, width, contracts, premium, shares, call_strike, notes.
 Use null for fields that don't apply.
 Today's date: """ + datetime.now().strftime("%m/%d/%Y") + """
