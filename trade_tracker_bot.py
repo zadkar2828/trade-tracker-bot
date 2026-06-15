@@ -90,7 +90,7 @@ Return ONLY the JSON."""
     response = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={"Content-Type": "application/json", "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01"},
-        json={"model": "claude-sonnet-4-20250514", "max_tokens": 500, "messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_base64}}, {"type": "text", "text": prompt}]}]},
+        json={"model": "claude-sonnet-4-6", "max_tokens": 500, "messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_base64}}, {"type": "text", "text": prompt}]}]},
         timeout=30
     )
     if response.status_code != 200:
@@ -249,7 +249,7 @@ LEAPS call: {json.dumps(leaps_call) if leaps_call else 'none'}
     response = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={"Content-Type": "application/json", "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01"},
-        json={"model": "claude-sonnet-4-20250514", "max_tokens": 800, "messages": [{"role": "user", "content": f"""Analyze this stock for options trader Z. His strategies: CSP (sell OTM put ~30DTE), Bull Put Spread, Bear Call Spread, Covered Call, LEAPS, PMCC.
+        json={"model": "claude-sonnet-4-6", "max_tokens": 800, "messages": [{"role": "user", "content": f"""Analyze this stock for options trader Z. His strategies: CSP (sell OTM put ~30DTE), Bull Put Spread, Bear Call Spread, Covered Call, LEAPS, PMCC.
 
 {context}
 
