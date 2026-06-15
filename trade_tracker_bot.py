@@ -133,7 +133,7 @@ def append_to_cc(ws, data):
     today = data.get("date_opened") or datetime.now().strftime("%-m/%-d/%Y")
     contracts = data.get("contracts") or data.get("shares") or 1
     ws.update(range_name=f"A{row}:E{row}", values=[[data.get("ticker",""), contracts, today, data.get("expiration",""), data.get("call_strike","") or data.get("strike_price","")]])
-    ws.update(range_name=f"G{row}", values=[[data.get("premium","")]])
+    ws.update(range_name=f"I{row}", values=[[data.get("premium","")]])
     return row
 
 def write_to_sheet(trade_data):
