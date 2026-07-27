@@ -71,16 +71,15 @@ Type definitions (IMPORTANT — read carefully):
 - BPS = Bull Put Spread: a PUT credit spread (sell higher-strike put, buy lower-strike put). Both legs are PUTS.
 - CS = Call Spread / Bear Call Spread: a CALL credit spread (sell lower-strike call, buy higher-strike call). Both legs are CALLS.
 
-If the screenshot shows "Sell ... Call" and "Buy ... Call" as the two legs, the type is CS, NOT BPS — even though both are credit spreads.
+If the screenshot shows "Sell ... Call" and "Buy ... Call" as the two legs, the type is CS, NOT BPS.
 If the screenshot shows "Sell ... Put" and "Buy ... Put" as the two legs, the type is BPS.
 
+IMPORTANT — expiration year:
+Always use the FULL year shown on the screenshot. Today is """ + datetime.now().strftime("%Y") + """. If the screenshot shows a month/day without a year, assume """ + datetime.now().strftime("%Y") + """. Never use a past year unless explicitly shown.
+
 IMPORTANT — premium field:
-Robinhood spread screenshots show a large dollar total at the top (e.g. "$70.00")
-which is the TOTAL credit/debit for ALL contracts combined. Do NOT use that number.
-Instead use the PER-SHARE "Limit price" value (e.g. "$0.70") shown in the
-order details — this is the premium per contract, which is what "premium"
-should contain. For CSP/CC trades, use the per-contract premium/limit price
-the same way, not any multiplied total.
+Robinhood spread screenshots show a large dollar total at the top (e.g. "$70.00") which is the TOTAL credit/debit for ALL contracts combined. Do NOT use that number.
+Instead use the PER-SHARE "Limit price" value (e.g. "$0.70") shown in the order details.
 
 Return JSON with type, ticker, date_opened, expiration, strike_price, short_strike, long_strike, width, contracts, premium, shares, call_strike, notes.
 Use null for fields that don't apply.
