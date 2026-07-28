@@ -3,10 +3,14 @@ name: Trade Tracker Bot
 on:
   workflow_dispatch:
 
+concurrency:
+  group: trade-tracker-bot
+  cancel-in-progress: true
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 390
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
 
