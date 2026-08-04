@@ -40,6 +40,43 @@ SERVICE_ACCOUNT_INFO = {
     "universe_domain": "googleapis.com"
 }
 
+# ── DATE NORMALIZATION ────────────────────────────────────────────────────────
+# Every date written to the sheet passes through here so the sheet never sees
+# mixed formats (e.g. "2026-07-31" alongside "07/31/2026"), which silently
+# broke the DTE formulas.
+DATE_FORMATS = [
+    "%m/%d/%Y",   # 07/31/2026
+    "%Y-%m-%d",   # 2026-07-31
+    "%m/%d/%y",   # 07/31/26
+    "%m-%d-%Y",   # 07-31-2026
+    "%Y/%m/%d",   # 2026/07/31
+    "%b %d, %Y",  # Jul 31, 2026
+    "%B %d, %Y",  # July 31, 2026
+    "%b %d %Y",   # Jul 31 2026
+    "%d %b %Y",   # 31 Jul 2026
+]
+
+def normalize_date(value):
+    """Return MM/DD/YYYY for any recognized date string. Passthrough if unparseable."""
+    if not value:
+        return value
+    s = str(value).strip()
+    for fmt in DATE_FORMATS:
+        try:
+            return datetime.strptime(s, fmt).strftime("%m/%d/%Y")
+        except ValueError:
+            continue
+    print(f"WARN: could not normalize date '{s}' — writing as-is")
+    return s
+
+def days_to_expiration(expiration):
+    """DTE from a normalized MM/DD/YYYY expiration. Empty string on failure."""
+    try:
+        exp = datetime.strptime(normalize_date(expiration), "%m/%d/%Y")
+        return (exp - datetime.now()).days
+    except Exception:
+        return ""
+
 def get_sheets_client():
     creds = Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO, scopes=SCOPES)
     return gspread.authorize(creds)
@@ -74,6 +111,17 @@ Type definitions (IMPORTANT — read carefully):
 If the screenshot shows "Sell ... Call" and "Buy ... Call" as the two legs, the type is CS, NOT BPS.
 If the screenshot shows "Sell ... Put" and "Buy ... Put" as the two legs, the type is BPS.
 
+IMPORTANT — date_opened (FILLED, not SUBMITTED):
+Robinhood order screenshots often show TWO timestamps: "Submitted" and "Filled".
+These can be DIFFERENT DAYS (e.g. Submitted 8/1, Filled 8/3).
+ALWAYS use the FILLED date for date_opened — that is when the position actually opened.
+Only fall back to the Submitted date if no Filled date appears on the screenshot.
+
+IMPORTANT — date format:
+Return EVERY date (date_opened and expiration) in MM/DD/YYYY format.
+Never return YYYY-MM-DD, never return a 2-digit year, never return "Jul 31" style text.
+Example: 07/31/2026 — correct. 2026-07-31 — WRONG.
+
 IMPORTANT — expiration year:
 Always use the FULL year shown on the screenshot. Today is """ + datetime.now().strftime("%Y") + """. If the screenshot shows a month/day without a year, assume """ + datetime.now().strftime("%Y") + """. Never use a past year unless explicitly shown.
 
@@ -97,39 +145,41 @@ Return ONLY the JSON."""
     response.raise_for_status()
     raw = response.json()["content"][0]["text"].strip()
     raw = re.sub(r"```json|```", "", raw).strip()
-    return json.loads(raw)
+    data = json.loads(raw)
+
+    # Force every date into MM/DD/YYYY before anything touches the sheet.
+    for field in ("date_opened", "expiration"):
+        if data.get(field):
+            original = data[field]
+            data[field] = normalize_date(original)
+            if str(original) != str(data[field]):
+                print(f"Normalized {field}: {original} -> {data[field]}")
+
+    return data
 
 def append_to_csp(ws, data):
     row = get_next_empty_row(ws)
-    today = data.get("date_opened") or datetime.now().strftime("%-m/%-d/%Y")
+    today = data.get("date_opened") or datetime.now().strftime("%m/%d/%Y")
     ws.update(range_name=f"A{row}:F{row}", values=[[data.get("ticker",""), data.get("strike_price",""), data.get("contracts",1), today, data.get("expiration",""), data.get("premium","")]])
     return row
 
 def append_to_bps(ws, data):
     row = get_next_empty_row(ws)
-    today = data.get("date_opened") or datetime.now().strftime("%-m/%-d/%Y")
-    try:
-        exp = datetime.strptime(data.get("expiration",""), "%m/%d/%Y")
-        dte = (exp - datetime.now()).days
-    except:
-        dte = ""
+    today = data.get("date_opened") or datetime.now().strftime("%m/%d/%Y")
+    dte = days_to_expiration(data.get("expiration",""))
     ws.update(range_name=f"A{row}:I{row}", values=[[today, data.get("ticker",""), data.get("short_strike",""), data.get("long_strike",""), data.get("width",""), data.get("expiration",""), dte, data.get("premium",""), data.get("contracts",1)]])
     return row
 
 def append_to_cs(ws, data):
     row = get_next_empty_row(ws)
-    today = data.get("date_opened") or datetime.now().strftime("%-m/%-d/%Y")
-    try:
-        exp = datetime.strptime(data.get("expiration",""), "%m/%d/%Y")
-        dte = (exp - datetime.now()).days
-    except:
-        dte = ""
+    today = data.get("date_opened") or datetime.now().strftime("%m/%d/%Y")
+    dte = days_to_expiration(data.get("expiration",""))
     ws.update(range_name=f"A{row}:I{row}", values=[[today, data.get("ticker",""), data.get("short_strike",""), data.get("long_strike",""), data.get("width",""), data.get("expiration",""), dte, data.get("premium",""), data.get("contracts",1)]])
     return row
 
 def append_to_cc(ws, data):
     row = get_next_empty_row(ws)
-    today = data.get("date_opened") or datetime.now().strftime("%-m/%-d/%Y")
+    today = data.get("date_opened") or datetime.now().strftime("%m/%d/%Y")
     contracts = data.get("contracts") or data.get("shares") or 1
     ws.update(range_name=f"A{row}:E{row}", values=[[data.get("ticker",""), contracts, today, data.get("expiration",""), data.get("call_strike","") or data.get("strike_price","")]])
     ws.update(range_name=f"I{row}", values=[[data.get("premium","")]])
@@ -343,7 +393,7 @@ async def on_message(message):
                 details = f"Call Strike: ${t.get('call_strike') or t.get('strike_price')} | Premium: ${t.get('premium')} | Exp: {t.get('expiration')}"
             else:
                 details = str(t)
-            msg = f"✅ **Trade logged!**\n📋 Tab: **{tab}** | Row: {row}\n📊 **{ticker} {trade_type}** — {details}\n🔗 [Open Tracker](https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID})"
+            msg = f"✅ **Trade logged!**\n📋 Tab: **{tab}** | Row: {row}\n📊 **{ticker} {trade_type}** — {details}\n📅 Opened: {t.get('date_opened','?')}\n🔗 [Open Tracker](https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID})"
             await message.remove_reaction("⏳", bot.user)
             await message.add_reaction("✅")
             await message.reply(msg)
