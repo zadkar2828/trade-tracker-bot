@@ -1,3 +1,15 @@
+"""
+Trade Tracker Bot — persistent Discord listener
+
+Watches two channels:
+  #trade-tracker — Robinhood fill screenshot -> Claude vision extract -> Sheets row
+  #stock-alerts  — $TICKER message -> Tradier quote/chains -> Claude analysis
+
+NOT a fire-and-exit job. Holds a Discord websocket and blocks until
+timeout-minutes expires. Runs never show green — duration is the health
+signal, not the status icon. ~5h55m = healthy full session.
+"""
+
 import discord
 import requests
 import json
@@ -6,9 +18,22 @@ from google.oauth2.service_account import Credentials
 import os
 import re
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import base64
 import aiohttp
 import traceback
+
+# ── TIMEZONE ──────────────────────────────────────────────────────────────────
+# GitHub Actions runners are UTC. Bare datetime.now() was the source of the
+# off-by-one DTE: expiration parses to midnight, now() is mid-morning, and
+# .days truncated 13d9h down to 13 on what is really a 14-day trade.
+ET = ZoneInfo("America/New_York")
+
+def now_et():
+    return datetime.now(ET)
+
+def today_et():
+    return now_et().date()
 
 DISCORD_BOT_TOKEN   = os.environ.get("DISCORD_TRADE_BOT_TOKEN", "")
 ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -16,6 +41,10 @@ TRADIER_TOKEN       = os.environ.get("TRADIER_TOKEN", "")
 SPREADSHEET_ID      = "1yEN54IvJ7E8h0Eh1R3HlXdWFUXO6ePQAs40IiznxjKY"
 TRADE_TRACKER_CHANNEL = "trade-tracker"
 STOCK_ALERTS_CHANNEL  = "stock-alerts"
+
+# Written to the ticker cell when extraction genuinely can't find one, so a
+# blank never slips into the sheet looking like a successful log.
+UNKNOWN_TICKER = "UNKNOWN"
 
 print(f"TRADIER_TOKEN present: {bool(TRADIER_TOKEN)}")
 print(f"ANTHROPIC_API_KEY present: {bool(ANTHROPIC_API_KEY)}")
@@ -69,11 +98,48 @@ def normalize_date(value):
     print(f"WARN: could not normalize date '{s}' — writing as-is")
     return s
 
-def days_to_expiration(expiration):
-    """DTE from a normalized MM/DD/YYYY expiration. Empty string on failure."""
+def days_to_expiration(expiration, opened=None):
+    """
+    Calendar DTE between the opened date and expiration.
+
+    Compares DATES, not datetimes. The old version subtracted a mid-morning
+    datetime.now() from a midnight expiration, so .days truncated 13d9h to 13
+    on a trade that is genuinely 14 days out. Every DTE the bot wrote was one
+    day short.
+    """
     try:
-        exp = datetime.strptime(normalize_date(expiration), "%m/%d/%Y")
-        return (exp - datetime.now()).days
+        exp = datetime.strptime(normalize_date(expiration), "%m/%d/%Y").date()
+    except Exception:
+        return ""
+    try:
+        start = datetime.strptime(normalize_date(opened), "%m/%d/%Y").date() if opened else today_et()
+    except Exception:
+        start = today_et()
+    return (exp - start).days
+
+def clean_ticker(value):
+    """
+    Normalize an extracted ticker. Returns None when there genuinely isn't one
+    — e.g. a redacted Robinhood order header — so the caller can flag it rather
+    than writing an empty cell that looks like a successful log.
+    """
+    if value is None:
+        return None
+    s = str(value).strip().upper().lstrip("$")
+    if not s or s in ("NULL", "NONE", "N/A", "?", "-"):
+        return None
+    if not re.fullmatch(r"[A-Z]{1,6}", s):
+        print(f"WARN: extracted ticker '{s}' is not a plausible symbol")
+        return None
+    return s
+
+def derive_width(data):
+    """Fall back to |short - long| when the model didn't return a width."""
+    w = data.get("width")
+    if w not in (None, "", 0):
+        return w
+    try:
+        return abs(float(data["short_strike"]) - float(data["long_strike"]))
     except Exception:
         return ""
 
@@ -96,7 +162,22 @@ async def image_to_base64(url):
             data = await resp.read()
             return base64.b64encode(data).decode("utf-8")
 
+def _first_text_block(payload):
+    """
+    Pull the first text block out of the API response.
+
+    Indexing content[0] blindly breaks if the response ever leads with a
+    non-text block.
+    """
+    for block in payload.get("content", []):
+        if block.get("type") == "text":
+            return block.get("text", "").strip()
+    return ""
+
 async def extract_trade_data(image_base64, image_url, media_type="image/png"):
+    year  = now_et().strftime("%Y")
+    today = now_et().strftime("%m/%d/%Y")
+
     prompt = """You are analyzing a trading screenshot from Robinhood.
 Extract ALL trade information visible and return ONLY a JSON object with no other text.
 
@@ -111,6 +192,16 @@ Type definitions (IMPORTANT — read carefully):
 If the screenshot shows "Sell ... Call" and "Buy ... Call" as the two legs, the type is CS, NOT BPS.
 If the screenshot shows "Sell ... Put" and "Buy ... Put" as the two legs, the type is BPS.
 
+IMPORTANT — ticker:
+The ticker is usually in the order title (e.g. "QQQ $685/$690 Put Credit Spread 8/21").
+Some screenshots have the title redacted, blurred, or replaced with a generic
+label like "Option order" — in that case look EVERYWHERE ELSE for the symbol:
+the leg descriptions, the position name, a chart header, a watchlist row, any
+breadcrumb or nav text.
+If after checking all of that the ticker genuinely does not appear anywhere in
+the image, return null for ticker. DO NOT GUESS and DO NOT infer it from the
+strike prices — a wrong ticker is far worse than a null one.
+
 IMPORTANT — date_opened (FILLED, not SUBMITTED):
 Robinhood order screenshots often show TWO timestamps: "Submitted" and "Filled".
 These can be DIFFERENT DAYS (e.g. Submitted 8/1, Filled 8/3).
@@ -123,7 +214,7 @@ Never return YYYY-MM-DD, never return a 2-digit year, never return "Jul 31" styl
 Example: 07/31/2026 — correct. 2026-07-31 — WRONG.
 
 IMPORTANT — expiration year:
-Always use the FULL year shown on the screenshot. Today is """ + datetime.now().strftime("%Y") + """. If the screenshot shows a month/day without a year, assume """ + datetime.now().strftime("%Y") + """. Never use a past year unless explicitly shown.
+Always use the FULL year shown on the screenshot. Today is """ + year + """. If the screenshot shows a month/day without a year, assume """ + year + """. Never use a past year unless explicitly shown.
 
 IMPORTANT — premium field:
 Robinhood spread screenshots show a large dollar total at the top (e.g. "$70.00") which is the TOTAL credit/debit for ALL contracts combined. Do NOT use that number.
@@ -131,7 +222,7 @@ Instead use the PER-SHARE "Limit price" value (e.g. "$0.70") shown in the order 
 
 Return JSON with type, ticker, date_opened, expiration, strike_price, short_strike, long_strike, width, contracts, premium, shares, call_strike, notes.
 Use null for fields that don't apply.
-Today's date: """ + datetime.now().strftime("%m/%d/%Y") + """
+Today's date: """ + today + """
 Return ONLY the JSON."""
 
     response = requests.post(
@@ -143,7 +234,8 @@ Return ONLY the JSON."""
     if response.status_code != 200:
         print(f"Claude API error {response.status_code}: {response.text[:500]}")
     response.raise_for_status()
-    raw = response.json()["content"][0]["text"].strip()
+
+    raw = _first_text_block(response.json())
     raw = re.sub(r"```json|```", "", raw).strip()
     data = json.loads(raw)
 
@@ -155,33 +247,40 @@ Return ONLY the JSON."""
             if str(original) != str(data[field]):
                 print(f"Normalized {field}: {original} -> {data[field]}")
 
+    # Ticker validation — a missing ticker is flagged, never written blank.
+    ticker = clean_ticker(data.get("ticker"))
+    data["ticker_missing"] = ticker is None
+    data["ticker"] = ticker or UNKNOWN_TICKER
+    if data["ticker_missing"]:
+        print("WARN: no ticker found in screenshot — writing UNKNOWN")
+
     return data
 
 def append_to_csp(ws, data):
     row = get_next_empty_row(ws)
-    today = data.get("date_opened") or datetime.now().strftime("%m/%d/%Y")
-    ws.update(range_name=f"A{row}:F{row}", values=[[data.get("ticker",""), data.get("strike_price",""), data.get("contracts",1), today, data.get("expiration",""), data.get("premium","")]])
+    opened = data.get("date_opened") or now_et().strftime("%m/%d/%Y")
+    ws.update(range_name=f"A{row}:F{row}", values=[[data.get("ticker",""), data.get("strike_price",""), data.get("contracts",1), opened, data.get("expiration",""), data.get("premium","")]])
     return row
 
 def append_to_bps(ws, data):
     row = get_next_empty_row(ws)
-    today = data.get("date_opened") or datetime.now().strftime("%m/%d/%Y")
-    dte = days_to_expiration(data.get("expiration",""))
-    ws.update(range_name=f"A{row}:I{row}", values=[[today, data.get("ticker",""), data.get("short_strike",""), data.get("long_strike",""), data.get("width",""), data.get("expiration",""), dte, data.get("premium",""), data.get("contracts",1)]])
+    opened = data.get("date_opened") or now_et().strftime("%m/%d/%Y")
+    dte = days_to_expiration(data.get("expiration",""), opened)
+    ws.update(range_name=f"A{row}:I{row}", values=[[opened, data.get("ticker",""), data.get("short_strike",""), data.get("long_strike",""), derive_width(data), data.get("expiration",""), dte, data.get("premium",""), data.get("contracts",1)]])
     return row
 
 def append_to_cs(ws, data):
     row = get_next_empty_row(ws)
-    today = data.get("date_opened") or datetime.now().strftime("%m/%d/%Y")
-    dte = days_to_expiration(data.get("expiration",""))
-    ws.update(range_name=f"A{row}:I{row}", values=[[today, data.get("ticker",""), data.get("short_strike",""), data.get("long_strike",""), data.get("width",""), data.get("expiration",""), dte, data.get("premium",""), data.get("contracts",1)]])
+    opened = data.get("date_opened") or now_et().strftime("%m/%d/%Y")
+    dte = days_to_expiration(data.get("expiration",""), opened)
+    ws.update(range_name=f"A{row}:I{row}", values=[[opened, data.get("ticker",""), data.get("short_strike",""), data.get("long_strike",""), derive_width(data), data.get("expiration",""), dte, data.get("premium",""), data.get("contracts",1)]])
     return row
 
 def append_to_cc(ws, data):
     row = get_next_empty_row(ws)
-    today = data.get("date_opened") or datetime.now().strftime("%m/%d/%Y")
+    opened = data.get("date_opened") or now_et().strftime("%m/%d/%Y")
     contracts = data.get("contracts") or data.get("shares") or 1
-    ws.update(range_name=f"A{row}:E{row}", values=[[data.get("ticker",""), contracts, today, data.get("expiration",""), data.get("call_strike","") or data.get("strike_price","")]])
+    ws.update(range_name=f"A{row}:E{row}", values=[[data.get("ticker",""), contracts, opened, data.get("expiration",""), data.get("call_strike","") or data.get("strike_price","")]])
     ws.update(range_name=f"I{row}", values=[[data.get("premium","")]])
     return row
 
@@ -225,9 +324,9 @@ def get_options_expirations(ticker):
         expirations = r.json()["expirations"]["date"]
         if isinstance(expirations, str):
             expirations = [expirations]
-        today = datetime.now()
-        exp_30 = next((e for e in expirations if datetime.strptime(e, "%Y-%m-%d") >= today + timedelta(days=25)), None)
-        exp_leaps = next((e for e in expirations if datetime.strptime(e, "%Y-%m-%d") >= today + timedelta(days=300)), None)
+        today = today_et()
+        exp_30 = next((e for e in expirations if datetime.strptime(e, "%Y-%m-%d").date() >= today + timedelta(days=25)), None)
+        exp_leaps = next((e for e in expirations if datetime.strptime(e, "%Y-%m-%d").date() >= today + timedelta(days=300)), None)
         return {"exp_30": exp_30, "exp_leaps": exp_leaps}
     except Exception as e:
         print(f"Tradier expirations error: {e}")
@@ -300,6 +399,9 @@ LEAPS call: {json.dumps(leaps_call) if leaps_call else 'none'}
         headers={"Content-Type": "application/json", "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01"},
         json={"model": "claude-sonnet-4-6", "max_tokens": 800, "messages": [{"role": "user", "content": f"""Analyze this stock for options trader Z. His strategies: CSP (sell OTM put ~30DTE), Bull Put Spread, Bear Call Spread, Covered Call, LEAPS, PMCC.
 
+His hard rules: $5 spread widths only, short-leg delta 0.18-0.22, OI floor 50,
+GTC close at 47% of credit, minimum 10% ROI computed on MAX LOSS not width.
+
 {context}
 
 Reply in this exact Discord format:
@@ -316,7 +418,7 @@ Reply in this exact Discord format:
         timeout=30
     )
     response.raise_for_status()
-    result = response.json()["content"][0]["text"].strip()
+    result = _first_text_block(response.json())
     print(f"Analysis complete for {ticker}")
     return result
 
@@ -325,13 +427,69 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = discord.Client(intents=intents)
 
+SUPPORTED_IMAGE_TYPES = {
+    ".png" : "image/png",
+    ".jpg" : "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif" : "image/gif",
+}
+
+def media_type_for(filename):
+    lower = filename.lower()
+    for ext, mtype in SUPPORTED_IMAGE_TYPES.items():
+        if lower.endswith(ext):
+            return mtype
+    return None
+
 @bot.event
 async def on_ready():
-    print(f"=== BOT READY: {bot.user} ===")
+    print(f"=== BOT READY: {bot.user} === [{now_et().strftime('%Y-%m-%d %H:%M:%S %Z')}]")
     for guild in bot.guilds:
         print(f"Server: {guild.name}")
         for ch in guild.channels:
             print(f"  #{ch.name} (type={ch.type})")
+
+async def process_attachment(message, attachment):
+    """Handle one screenshot. Returns a reply string."""
+    media_type = media_type_for(attachment.filename)
+    if not media_type:
+        return None
+
+    image_b64  = await image_to_base64(attachment.url)
+    trade_data = await extract_trade_data(image_b64, attachment.url, media_type)
+    print(f"Trade data: {trade_data}")
+    tab, row = write_to_sheet(trade_data)
+
+    t          = trade_data
+    trade_type = t.get("type", "")
+    ticker     = t.get("ticker", UNKNOWN_TICKER)
+    missing    = t.get("ticker_missing", False)
+
+    if trade_type in ["BPS", "CS"]:
+        details = f"${t.get('short_strike')} / ${t.get('long_strike')} | Premium: ${t.get('premium')} | Exp: {t.get('expiration')}"
+    elif trade_type == "CSP":
+        details = f"Strike: ${t.get('strike_price')} | Premium: ${t.get('premium')} | Exp: {t.get('expiration')}"
+    elif trade_type == "CC":
+        details = f"Call Strike: ${t.get('call_strike') or t.get('strike_price')} | Premium: ${t.get('premium')} | Exp: {t.get('expiration')}"
+    else:
+        details = str(t)
+
+    header = "⚠️ **Trade logged — TICKER MISSING**" if missing else "✅ **Trade logged!**"
+    msg = (
+        f"{header}\n"
+        f"📋 Tab: **{tab}** | Row: {row}\n"
+        f"📊 **{ticker} {trade_type}** — {details}\n"
+        f"📅 Opened: {t.get('date_opened','?')}\n"
+    )
+    if missing:
+        msg += (
+            f"🚨 No ticker was visible in the screenshot — the header may be "
+            f"redacted or cropped. Row {row} on tab **{tab}** was written with "
+            f"`{UNKNOWN_TICKER}` in column B. Fix it by hand.\n"
+        )
+    msg += f"🔗 [Open Tracker](https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID})"
+    return msg
 
 @bot.event
 async def on_message(message):
@@ -363,50 +521,45 @@ async def on_message(message):
         if not message.attachments:
             return
 
-        attachment = message.attachments[0]
-        filename_lower = attachment.filename.lower()
-        if filename_lower.endswith(".png"):
-            media_type = "image/png"
-        elif filename_lower.endswith((".jpg", ".jpeg")):
-            media_type = "image/jpeg"
-        elif filename_lower.endswith(".webp"):
-            media_type = "image/webp"
-        elif filename_lower.endswith(".gif"):
-            media_type = "image/gif"
-        else:
+        images = [a for a in message.attachments if media_type_for(a.filename)]
+        if not images:
             return
 
+        # Both legs of a condor often arrive as two screenshots in ONE message.
+        # The old code read attachments[0] and silently dropped the rest.
         await message.add_reaction("⏳")
-        try:
-            image_b64 = await image_to_base64(attachment.url)
-            trade_data = await extract_trade_data(image_b64, attachment.url, media_type)
-            print(f"Trade data: {trade_data}")
-            tab, row = write_to_sheet(trade_data)
-            t = trade_data
-            trade_type = t.get("type","")
-            ticker = t.get("ticker","?")
-            if trade_type in ["BPS","CS"]:
-                details = f"${t.get('short_strike')} / ${t.get('long_strike')} | Premium: ${t.get('premium')} | Exp: {t.get('expiration')}"
-            elif trade_type == "CSP":
-                details = f"Strike: ${t.get('strike_price')} | Premium: ${t.get('premium')} | Exp: {t.get('expiration')}"
-            elif trade_type == "CC":
-                details = f"Call Strike: ${t.get('call_strike') or t.get('strike_price')} | Premium: ${t.get('premium')} | Exp: {t.get('expiration')}"
-            else:
-                details = str(t)
-            msg = f"✅ **Trade logged!**\n📋 Tab: **{tab}** | Row: {row}\n📊 **{ticker} {trade_type}** — {details}\n📅 Opened: {t.get('date_opened','?')}\n🔗 [Open Tracker](https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID})"
-            await message.remove_reaction("⏳", bot.user)
-            await message.add_reaction("✅")
-            await message.reply(msg)
-        except Exception as e:
-            print(f"Trade error: {traceback.format_exc()}")
-            await message.remove_reaction("⏳", bot.user)
+        any_missing = False
+        replies     = []
+        failures    = []
+
+        for idx, attachment in enumerate(images, start=1):
+            try:
+                reply = await process_attachment(message, attachment)
+                if reply:
+                    prefix = f"**[{idx}/{len(images)}]**\n" if len(images) > 1 else ""
+                    replies.append(prefix + reply)
+                    if "TICKER MISSING" in reply:
+                        any_missing = True
+            except Exception as e:
+                print(f"Trade error on attachment {idx}: {traceback.format_exc()}")
+                failures.append(f"❌ Image {idx}: {str(e)}")
+
+        await message.remove_reaction("⏳", bot.user)
+
+        if replies and not failures:
+            await message.add_reaction("⚠️" if any_missing else "✅")
+        elif replies and failures:
+            await message.add_reaction("⚠️")
+        else:
             await message.add_reaction("❌")
-            await message.reply(f"❌ Could not read trade: {str(e)}")
+
+        for chunk in replies + failures:
+            await message.reply(chunk)
 
     except Exception as e:
         print(f"on_message crash: {traceback.format_exc()}")
 
-print("Starting bot...")
+print(f"Starting bot... [{now_et().strftime('%Y-%m-%d %H:%M:%S %Z')}]")
 if not DISCORD_BOT_TOKEN:
     raise ValueError("DISCORD_TRADE_BOT_TOKEN missing")
 bot.run(DISCORD_BOT_TOKEN)
