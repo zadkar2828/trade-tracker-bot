@@ -162,6 +162,50 @@ async def image_to_base64(url):
             data = await resp.read()
             return base64.b64encode(data).decode("utf-8")
 
+DISCORD_MAX_CHARS = 1900   # real cap is 2000; leave room for the [n/m] prefix
+
+def chunk_for_discord(text, limit=DISCORD_MAX_CHARS):
+    """
+    Split a message so no piece exceeds Discord's 2000-character limit.
+
+    analyze_stock returns up to 800 tokens, which can run well past 2000 chars.
+    Sending it in one reply returned:
+        400 Bad Request (error code: 50035): Invalid Form Body
+        In content: Must be 2000 or fewer in length.
+    send_telegram already chunked; the Discord reply path never did.
+    Splits on line boundaries so formatting survives.
+    """
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+
+    chunks, current = [], ""
+    for line in text.split("\n"):
+        # A single line longer than the limit has to be hard-split.
+        while len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        if len(current) + len(line) + 1 > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = line if not current else current + "\n" + line
+    if current:
+        chunks.append(current)
+    return chunks
+
+async def reply_chunked(message, text):
+    """Reply in Discord-safe pieces, numbering them when there is more than one."""
+    parts = chunk_for_discord(text)
+    total = len(parts)
+    for i, part in enumerate(parts, start=1):
+        body = part if total == 1 else f"**[{i}/{total}]**\n{part}"
+        await message.reply(body)
+
 def _first_text_block(payload):
     """
     Pull the first text block out of the API response.
@@ -508,11 +552,11 @@ async def on_message(message):
                 try:
                     analysis = await analyze_stock(ticker)
                     await message.remove_reaction("⏳", bot.user)
-                    await message.reply(analysis)
+                    await reply_chunked(message, analysis)
                 except Exception as e:
                     print(f"Analysis error: {traceback.format_exc()}")
                     await message.remove_reaction("⏳", bot.user)
-                    await message.reply(f"❌ Analysis failed for **{ticker}**: {str(e)}")
+                    await reply_chunked(message, f"❌ Analysis failed for **{ticker}**: {str(e)}")
             return
 
         # ── TRADE TRACKER ─────────────────────────────────────────────────────
@@ -554,7 +598,7 @@ async def on_message(message):
             await message.add_reaction("❌")
 
         for chunk in replies + failures:
-            await message.reply(chunk)
+            await reply_chunked(message, chunk)
 
     except Exception as e:
         print(f"on_message crash: {traceback.format_exc()}")
