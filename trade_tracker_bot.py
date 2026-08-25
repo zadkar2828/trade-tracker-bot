@@ -377,11 +377,18 @@ def get_options_expirations(ticker):
         return None
 
 def get_options_chain(ticker, expiration, option_type="put"):
+    """
+    Fetch one side of a chain WITH greeks.
+
+    greeks was "false", so strike selection had no delta to work with and fell
+    back to percent-of-price guesses. Z's rules are delta rules, so the greeks
+    have to come down with the chain.
+    """
     try:
         r = requests.get(
             "https://api.tradier.com/v1/markets/options/chains",
             headers={"Authorization": f"Bearer {TRADIER_TOKEN}", "Accept": "application/json"},
-            params={"symbol": ticker, "expiration": expiration, "greeks": "false"}, timeout=10
+            params={"symbol": ticker, "expiration": expiration, "greeks": "true"}, timeout=15
         )
         r.raise_for_status()
         options = r.json()["options"]["option"]
@@ -391,9 +398,153 @@ def get_options_chain(ticker, expiration, option_type="put"):
         print(f"Tradier chain error: {e}")
         return []
 
+# ── STRIKE SELECTION ──────────────────────────────────────────────────────────
+# Z's hard rules, enforced in the SELECTION, not just described in the prompt.
+TARGET_DELTA_LO = 0.18
+TARGET_DELTA_HI = 0.22
+ACCEPT_DELTA_LO = 0.15
+ACCEPT_DELTA_HI = 0.30
+SPREAD_WIDTH    = 5.0     # dollars — $5 only, $10+ banned
+MIN_OI          = 50
+LEAPS_DELTA_LO  = 0.78
+LEAPS_DELTA_HI  = 0.92
+
+def opt_delta(o):
+    """Absolute delta, or None when the chain didn't return greeks."""
+    g = o.get("greeks") or {}
+    d = g.get("delta")
+    if d in (None, ""):
+        return None
+    try:
+        return abs(float(d))
+    except (TypeError, ValueError):
+        return None
+
+def opt_oi(o):
+    try:
+        return int(o.get("open_interest", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
 def find_strike_near(options, target_price):
-    best = min(options, key=lambda o: abs(o.get("strike", 0) - target_price), default=None)
-    return best
+    """Nearest strike to a dollar price. Kept for callers that want price, not delta."""
+    if not options:
+        return None
+    return min(options, key=lambda o: abs(float(o.get("strike", 0) or 0) - target_price),
+               default=None)
+
+def find_by_delta(options, lo=TARGET_DELTA_LO, hi=TARGET_DELTA_HI, require_oi=True):
+    """
+    Pick the short leg by DELTA, preferring the 0.18-0.22 band, widening to
+    0.15-0.30 before giving up.
+
+    The old code took a fixed 5% OTM strike. On BNTX that landed 4.7% out with
+    a delta far above 0.22; on a low-vol name the same 5% is nearly worthless.
+    Percent-of-price is not a risk measure — delta is.
+    """
+    if not options:
+        return None
+
+    def pool(band_lo, band_hi, oi_gate):
+        out = []
+        for o in options:
+            d = opt_delta(o)
+            if d is None or not (band_lo <= d <= band_hi):
+                continue
+            if oi_gate and opt_oi(o) < MIN_OI:
+                continue
+            out.append(o)
+        return out
+
+    mid = (lo + hi) / 2
+    for band_lo, band_hi, oi_gate in (
+        (lo, hi, require_oi),
+        (ACCEPT_DELTA_LO, ACCEPT_DELTA_HI, require_oi),
+        (lo, hi, False),
+        (ACCEPT_DELTA_LO, ACCEPT_DELTA_HI, False),
+    ):
+        cands = pool(band_lo, band_hi, oi_gate)
+        if cands:
+            return min(cands, key=lambda o: abs((opt_delta(o) or 0) - mid))
+
+    # No greeks at all on this chain — caller falls back to price-based.
+    return None
+
+def find_spread_long(options, short_opt, direction, width=SPREAD_WIDTH):
+    """
+    Given a short leg, find the long leg exactly `width` dollars away.
+
+    direction: "put"  -> long strike BELOW short  (bull put spread)
+               "call" -> long strike ABOVE short  (bear call spread)
+
+    Returns (long_option, actual_width). actual_width lets the caller see when
+    the chain's strike increments can't produce a true $5 spread — which is
+    exactly how the $60 LLY and $8.50 MRNA widths got reported as tradeable.
+    """
+    if not options or not short_opt:
+        return None, None
+    try:
+        short_strike = float(short_opt.get("strike", 0) or 0)
+    except (TypeError, ValueError):
+        return None, None
+    if short_strike <= 0:
+        return None, None
+
+    if direction == "put":
+        target = short_strike - width
+        side = [o for o in options
+                if float(o.get("strike", 0) or 0) < short_strike]
+    else:
+        target = short_strike + width
+        side = [o for o in options
+                if float(o.get("strike", 0) or 0) > short_strike]
+    if not side:
+        return None, None
+
+    best = min(side, key=lambda o: abs(float(o.get("strike", 0) or 0) - target))
+    actual = round(abs(float(best.get("strike", 0) or 0) - short_strike), 2)
+    return best, actual
+
+def find_leaps_leg(options):
+    """Deep-ITM long call for LEAPS/PMCC: 78-92 delta, OI floor enforced."""
+    if not options:
+        return None
+    cands = [o for o in options
+             if (opt_delta(o) is not None
+                 and LEAPS_DELTA_LO <= opt_delta(o) <= LEAPS_DELTA_HI
+                 and opt_oi(o) >= MIN_OI)]
+    if not cands:
+        cands = [o for o in options
+                 if opt_delta(o) is not None
+                 and LEAPS_DELTA_LO <= opt_delta(o) <= LEAPS_DELTA_HI]
+    if not cands:
+        return None
+    return max(cands, key=opt_oi)
+
+def describe(o, extra=None):
+    """Compact, explicit contract summary — strike, prices, delta, OI, spread %."""
+    if not o:
+        return "none"
+    try:
+        bid = float(o.get("bid", 0) or 0)
+        ask = float(o.get("ask", 0) or 0)
+    except (TypeError, ValueError):
+        bid = ask = 0.0
+    mid = round((bid + ask) / 2, 2)
+    spread_pct = round(((ask - bid) / mid) * 100, 1) if mid > 0 else None
+    d = opt_delta(o)
+    parts = [
+        f"strike ${o.get('strike')}",
+        f"bid ${bid}",
+        f"ask ${ask}",
+        f"mid ${mid}",
+        f"delta {round(d, 3) if d is not None else 'n/a'}",
+        f"OI {opt_oi(o)}",
+        f"bid/ask {spread_pct}% of mid" if spread_pct is not None else "bid/ask n/a",
+    ]
+    if extra:
+        parts.append(extra)
+    return " | ".join(parts)
 
 async def analyze_stock(ticker):
     ticker = ticker.upper()
@@ -417,12 +568,45 @@ async def analyze_stock(ticker):
     calls = get_options_chain(ticker, exp_30, "call") if exp_30 else []
     leaps = get_options_chain(ticker, exp_leaps, "call") if exp_leaps else []
 
-    csp = find_strike_near(puts, price * 0.95)
-    spread_short = find_strike_near(puts, price * 0.95)
-    spread_long = find_strike_near(puts, price * 0.90)
-    call_spread_short = find_strike_near(calls, price * 1.05)
-    call_spread_long = find_strike_near(calls, price * 1.10)
-    leaps_call = find_strike_near(leaps, price * 1.10) if leaps else None
+    # ── delta-first short legs, $5-wide long legs ─────────────────────────
+    # Falls back to a percent-of-price strike ONLY when the chain returned no
+    # greeks at all, and says so in the context so the model doesn't present a
+    # guessed strike as a delta-selected one.
+    greeks_missing = []
+
+    csp = find_by_delta(puts)
+    if csp is None:
+        csp = find_strike_near(puts, price * 0.95)
+        greeks_missing.append("CSP")
+
+    spread_short = find_by_delta(puts)
+    if spread_short is None:
+        spread_short = find_strike_near(puts, price * 0.95)
+        greeks_missing.append("bull put short")
+    spread_long, bps_width = find_spread_long(puts, spread_short, "put")
+
+    call_spread_short = find_by_delta(calls)
+    if call_spread_short is None:
+        call_spread_short = find_strike_near(calls, price * 1.05)
+        greeks_missing.append("bear call short")
+    call_spread_long, cs_width = find_spread_long(calls, call_spread_short, "call")
+
+    leaps_call = find_leaps_leg(leaps) if leaps else None
+    if leaps and leaps_call is None:
+        leaps_call = find_strike_near(leaps, price * 0.85)
+        greeks_missing.append("LEAPS")
+
+    def width_note(w):
+        if w is None:
+            return "no long leg available"
+        if abs(w - SPREAD_WIDTH) < 0.01:
+            return f"width ${w} OK"
+        return f"width ${w} — CHAIN CANNOT MAKE A $5 SPREAD, RULE FAIL"
+
+    greeks_note = ("\nNOTE: chain returned no greeks for: "
+                   + ", ".join(greeks_missing)
+                   + " — those strikes are price-based guesses, NOT delta-selected. "
+                     "Say so and treat delta as unverified.") if greeks_missing else ""
 
     context = f"""
 Ticker: {ticker} | Price: ${price}
@@ -430,21 +614,37 @@ Ticker: {ticker} | Price: ${price}
 Change: {stock.get('change_pct')}%
 30DTE exp: {exp_30} | LEAPS exp: {exp_leaps}
 
-CSP candidate: {json.dumps(csp) if csp else 'none'}
-Bull Put Spread short: {json.dumps(spread_short) if spread_short else 'none'}
-Bull Put Spread long: {json.dumps(spread_long) if spread_long else 'none'}
-Bear Call Spread short: {json.dumps(call_spread_short) if call_spread_short else 'none'}
-Bear Call Spread long: {json.dumps(call_spread_long) if call_spread_long else 'none'}
-LEAPS call: {json.dumps(leaps_call) if leaps_call else 'none'}
+CSP candidate: {describe(csp)}
+Bull Put Spread short: {describe(spread_short)}
+Bull Put Spread long:  {describe(spread_long)}  [{width_note(bps_width)}]
+Bear Call Spread short: {describe(call_spread_short)}
+Bear Call Spread long:  {describe(call_spread_long)}  [{width_note(cs_width)}]
+LEAPS call: {describe(leaps_call)}
+{greeks_note}
 """
     print(f"Calling Claude for analysis...")
     response = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={"Content-Type": "application/json", "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01"},
-        json={"model": "claude-sonnet-4-6", "max_tokens": 800, "messages": [{"role": "user", "content": f"""Analyze this stock for options trader Z. His strategies: CSP (sell OTM put ~30DTE), Bull Put Spread, Bear Call Spread, Covered Call, LEAPS, PMCC.
+        json={"model": "claude-sonnet-4-6", "max_tokens": 1200, "messages": [{"role": "user", "content": f"""Analyze this stock for options trader Z. His strategies: CSP (sell OTM put ~30DTE), Bull Put Spread, Bear Call Spread, Covered Call, LEAPS, PMCC.
 
-His hard rules: $5 spread widths only, short-leg delta 0.18-0.22, OI floor 50,
-GTC close at 47% of credit, minimum 10% ROI computed on MAX LOSS not width.
+HARD RULES (a violation changes the verdict to FAIL — never a footnote under a PASS):
+- Spread width: $5 ONLY. $10+ widths are banned. The width is printed in
+  brackets next to each long leg — if it does not say "width $5.0 OK", the
+  spread FAILS. Do not present a non-$5 spread as tradeable.
+- Short-leg delta: target 0.18-0.22, acceptable 0.15-0.30.
+- Open interest: 50 minimum on EVERY leg, 100+ preferred.
+- GTC close at 47% of credit received (Z takes 53% profit, never holds to expiry).
+- Minimum 10% ROI computed on MAX LOSS, not on width. For a $5 spread:
+  ROI = credit / (5 - credit).
+- CSPs are judged on ROI = credit / (strike - credit) and rarely clear 10%
+  outside high-IV names; say the number, don't force it against the spread floor.
+- Bid/ask wider than 5% of mid is a liquidity FAIL regardless of OI.
+- If the short bid is below the long ask the spread is a DEBIT, not a credit —
+  call that out and FAIL it.
+
+Report each strategy's actual numbers. If nothing passes, say so plainly and
+name no "best play" — an empty answer is correct when the chain is untradeable.
 
 {context}
 
