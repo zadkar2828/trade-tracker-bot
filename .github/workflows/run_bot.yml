@@ -3,6 +3,10 @@ name: Trade Tracker Bot
 on:
   workflow_dispatch:
 
+# Only one copy of the bot may hold the Discord connection. A new dispatch
+# cancels the running one by design. If a run dies early with
+# "The operation was canceled", check the run's Annotations: the notice says
+# whether a person canceled it or a newer dispatch replaced it.
 concurrency:
   group: trade-tracker-bot
   cancel-in-progress: true
@@ -28,4 +32,7 @@ jobs:
           GOOGLE_PRIVATE_KEY:      ${{ secrets.GOOGLE_PRIVATE_KEY }}
           TRADIER_TOKEN:           ${{ secrets.TRADIER_TOKEN }}
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-        run: python trade_tracker_bot.py
+        # -u = unbuffered. Without it, print() output is held in a buffer while
+        # the bot runs, so the log shows nothing from the bot (no BOT READY, no
+        # MSG lines) and a canceled run loses it entirely.
+        run: python -u trade_tracker_bot.py
