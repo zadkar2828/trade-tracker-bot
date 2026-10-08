@@ -694,6 +694,19 @@ async def on_ready():
         for ch in guild.channels:
             print(f"  #{ch.name} (type={ch.type})")
 
+GTC_CLOSE_PCT = 0.47   # buy back at 47% of credit = lock in 53% profit
+
+def close_at_53_line(premium):
+    """Footer line: the GTC buyback price that locks in 53% profit.
+    Returns "" if the premium can't be read, so a bad parse never breaks the reply."""
+    try:
+        credit = float(str(premium).replace("$", "").replace(",", "").strip())
+    except (TypeError, ValueError):
+        return ""
+    if credit <= 0:
+        return ""
+    return f"\n🎯 Close at 53% profit: GTC buyback at ${credit * GTC_CLOSE_PCT:.2f}"
+
 async def process_attachment(message, attachment):
     """Handle one screenshot. Returns a reply string."""
     media_type = media_type_for(attachment.filename)
@@ -733,6 +746,7 @@ async def process_attachment(message, attachment):
             f"`{UNKNOWN_TICKER}` in column B. Fix it by hand.\n"
         )
     msg += f"🔗 [Open Tracker](https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID})"
+    msg += close_at_53_line(t.get("premium"))
     return msg
 
 @bot.event
