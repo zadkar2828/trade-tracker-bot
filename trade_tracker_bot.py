@@ -634,7 +634,7 @@ HARD RULES (a violation changes the verdict to FAIL — never a footnote under a
   spread FAILS. Do not present a non-$5 spread as tradeable.
 - Short-leg delta: target 0.18-0.22, acceptable 0.15-0.30.
 - Open interest: 50 minimum on EVERY leg, 100+ preferred.
-- GTC close at 47% of credit received (Z takes 53% profit, never holds to expiry).
+- GTC close at 50% of credit received (Z takes 50% profit, never holds to expiry).
 - Minimum 10% ROI computed on MAX LOSS, not on width. For a $5 spread:
   ROI = credit / (5 - credit).
 - CSPs are judged on ROI = credit / (strike - credit) and rarely clear 10%
@@ -694,10 +694,10 @@ async def on_ready():
         for ch in guild.channels:
             print(f"  #{ch.name} (type={ch.type})")
 
-GTC_CLOSE_PCT = 0.47   # buy back at 47% of credit = lock in 53% profit
+GTC_CLOSE_PCT = 0.50   # buy back at 50% of credit = lock in 50% profit
 
 def close_at_53_line(premium):
-    """Footer line: the GTC buyback price that locks in 53% profit.
+    """Footer line: the GTC buyback price that locks in 50% profit.
     Returns "" if the premium can't be read, so a bad parse never breaks the reply."""
     try:
         credit = float(str(premium).replace("$", "").replace(",", "").strip())
@@ -705,7 +705,7 @@ def close_at_53_line(premium):
         return ""
     if credit <= 0:
         return ""
-    return f"\n🎯 Close at 53% profit: GTC buyback at ${credit * GTC_CLOSE_PCT:.2f}"
+    return f"\n🎯 Close at 50% profit: GTC buyback at ${credit * GTC_CLOSE_PCT:.2f}"
 
 async def process_attachment(message, attachment):
     """Handle one screenshot. Returns a reply string."""
